@@ -1,0 +1,4 @@
+pySigma>=1.1.0
+pySigma-backend-kusto>=1.0.0
+sigma-cli>=2.0.0
+PyYAML>=6.0
