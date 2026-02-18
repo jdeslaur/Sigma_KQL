@@ -2,3 +2,10 @@ pySigma>=1.1.0
 pySigma-backend-kusto>=1.0.0
 sigma-cli>=2.0.0
 PyYAML>=6.0
+
+# Threat Hunting Agent dependencies
+anthropic>=0.40.0           # Claude API for LLM-powered IOC extraction
+requests>=2.31.0            # HTTP client for OSINT feeds, Cribl API, NIST NVD
+rich>=13.0.0                # Terminal UI for human-in-the-loop triage CLI
+mitreattack-python>=5.4.0   # ATT&CK v18 STIX bundle parser (DETxxxx, ANxxxx)
+stix2>=3.0.0                # STIX 2.1 object handling (dependency of mitreattack-python)

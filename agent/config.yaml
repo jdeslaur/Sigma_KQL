@@ -1,0 +1,88 @@
+# Threat Hunting Agent for Cribl Search
+# Copy this file and fill in your values, or set environment variables.
+
+cribl:
+  search_url: ${CRIBL_SEARCH_URL}          # e.g. https://cribl-search.example.com
+  api_key: ${CRIBL_API_KEY}
+  default_dataset: archived_logs
+  time_range_days: 90                       # how far back to search archived data
+
+llm:
+  provider: anthropic
+  model: claude-opus-4-6
+  api_key: ${ANTHROPIC_API_KEY}
+  max_tokens: 4096
+
+mitre:
+  stix_bundle_path: enterprise-attack.json  # auto-downloaded from GitHub if missing
+  auto_refresh: true                         # re-download when a new ATT&CK release is available
+  domains:
+    - enterprise                             # enterprise | mobile | ics
+  stix_data_repo: https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/enterprise-attack/enterprise-attack.json
+
+ioc_sources:
+  mitre_detection_strategies:
+    enabled: true
+    scan_all_on_startup: false              # true = full coverage sweep at startup (slow)
+
+  osint:
+    - name: abuse_ch_urlhaus
+      url: https://urlhaus-api.abuse.ch/v1/urls/recent/
+      enabled: true
+    - name: abuse_ch_malwarebazaar
+      url: https://mb-api.abuse.ch/api/v1/
+      enabled: true
+    - name: feodo_tracker
+      url: https://feodotracker.abuse.ch/downloads/ipblocklist.json
+      enabled: true
+    - name: alientvault_otx
+      api_key: ${OTX_API_KEY}
+      enabled: false                        # requires OTX account
+
+  cve_feeds:
+    - name: nist_nvd
+      url: https://services.nvd.nist.gov/rest/json/cves/2.0
+      enabled: true
+      lookback_days: 7                      # fetch CVEs published in last N days
+      min_cvss_score: 7.0                   # only hunt for high/critical CVEs
+
+  # Analyst-supplied URLs for LLM-driven IOC extraction
+  # Add threat intel blog posts, advisories, or news articles here
+  news_urls: []
+
+  # Commercial TI adapter — implement CommercialTIAdapter interface
+  commercial:
+    enabled: false
+    adapter: null                           # e.g. "recorded_future" | "crowdstrike"
+    api_key: ${COMMERCIAL_TI_API_KEY}
+
+siem:
+  adapter: syslog                           # sentinel | splunk | syslog
+  # --- Sentinel ---
+  sentinel:
+    workspace_id: ${SENTINEL_WORKSPACE_ID}
+    shared_key: ${SENTINEL_SHARED_KEY}
+    log_type: ThreatHuntingFindings
+  # --- Splunk HEC ---
+  splunk:
+    hec_url: ${SPLUNK_HEC_URL}
+    token: ${SPLUNK_HEC_TOKEN}
+    index: threat_hunting
+    sourcetype: cribl:hunt:finding
+  # --- Syslog ---
+  syslog:
+    host: localhost
+    port: 514
+    protocol: udp                           # udp | tcp
+
+schedule:
+  ioc_refresh_minutes: 60
+  hunt_on_new_ioc: true                     # trigger a hunt immediately on new IOC arrival
+  max_concurrent_search_jobs: 5
+
+state:
+  db_path: agent_state.db                   # SQLite file for hit tracking
+
+logging:
+  level: INFO                               # DEBUG | INFO | WARNING | ERROR
+  file: agent.log
