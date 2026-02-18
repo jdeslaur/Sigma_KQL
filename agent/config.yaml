@@ -25,6 +25,16 @@ ioc_sources:
     enabled: true
     scan_all_on_startup: false              # true = full coverage sweep at startup (slow)
 
+    # Web scraper: supplements the STIX bundle by crawling individual DETxxxx pages
+    # on attack.mitre.org to catch strategies published before the next STIX release.
+    web_scraper:
+      enabled: false                        # set true to enable supplemental web scraping
+      start: 1                              # first DET number to check
+      end: 9999                             # last DET number to check (stops on consecutive 404s)
+      request_delay: 1.0                    # seconds between requests (be polite to MITRE)
+      stop_on_consecutive_misses: 20        # stop early after N consecutive 404s
+      cache_dir: .mitre_det_cache           # cache raw HTML pages here to avoid re-fetching
+
   osint:
     - name: abuse_ch_urlhaus
       url: https://urlhaus-api.abuse.ch/v1/urls/recent/

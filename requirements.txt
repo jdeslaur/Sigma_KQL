@@ -9,3 +9,4 @@ requests>=2.31.0            # HTTP client for OSINT feeds, Cribl API, NIST NVD
 rich>=13.0.0                # Terminal UI for human-in-the-loop triage CLI
 mitreattack-python>=5.4.0   # ATT&CK v18 STIX bundle parser (DETxxxx, ANxxxx)
 stix2>=3.0.0                # STIX 2.1 object handling (dependency of mitreattack-python)
+beautifulsoup4>=4.12.0      # HTML parser for DETxxxx web page scraper (optional but recommended)

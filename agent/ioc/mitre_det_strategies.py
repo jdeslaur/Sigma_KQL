@@ -9,13 +9,20 @@ Analytics (ANxxxx) as first-class STIX objects. This module:
   3. Provides lookup by technique ID to drive Cribl Search query generation.
   4. Optionally emits TTP-type IOCs for every DETxxxx entry to seed the hunt queue.
 
+Supplemental web scraper:
+  Crawls https://attack.mitre.org/detectionstrategies/DETxxxx/ from 0001–9999
+  to catch any strategies published on the ATT&CK website before the next STIX
+  bundle release. Results are merged into the in-memory strategy index.
+
 Dependencies:
-    pip install mitreattack-python stix2 requests
+    pip install mitreattack-python stix2 requests beautifulsoup4
 """
 
 import json
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -244,6 +251,20 @@ class MitreDetectionStrategies:
         self._ensure_bundle()
         self._load()
 
+        # Supplemental web scraper — runs after STIX bundle is loaded to catch
+        # any DETxxxx strategies published on the website before the next STIX release.
+        scraper_cfg = config.get("ioc_sources", {}).get(
+            "mitre_detection_strategies", {}
+        ).get("web_scraper", {})
+        if scraper_cfg.get("enabled", False):
+            self.scrape_web_pages(
+                start=int(scraper_cfg.get("start", 1)),
+                end=int(scraper_cfg.get("end", 9999)),
+                request_delay=float(scraper_cfg.get("request_delay", 1.0)),
+                stop_on_consecutive_misses=int(scraper_cfg.get("stop_on_consecutive_misses", 20)),
+                cache_dir=scraper_cfg.get("cache_dir"),
+            )
+
     def _ensure_bundle(self) -> None:
         if not self._bundle_path.exists():
             success = download_stix_bundle(self._bundle_path, self._bundle_url)
@@ -325,6 +346,72 @@ class MitreDetectionStrategies:
         logger.info("Emitted %d TTP IOCs from MITRE Detection Strategies", len(iocs))
         return iocs
 
+    # --- Web scraper supplement ---
+
+    def scrape_web_pages(
+        self,
+        start: int = 1,
+        end: int = 9999,
+        request_delay: float = 1.0,
+        stop_on_consecutive_misses: int = 20,
+        cache_dir: Optional[str | Path] = None,
+    ) -> int:
+        """
+        Crawl https://attack.mitre.org/detectionstrategies/DETxxxx/ from *start*
+        to *end*, merging any newly discovered strategies into the in-memory index.
+
+        This supplements the STIX bundle by catching strategies that the ATT&CK
+        website has published before the next official STIX bundle release.
+
+        Args:
+            start:                      First DET number to try (default 1)
+            end:                        Last DET number to try (default 9999)
+            request_delay:              Seconds to sleep between requests (be polite)
+            stop_on_consecutive_misses: Stop early after this many 404s in a row
+            cache_dir:                  Directory to cache raw HTML pages (optional)
+
+        Returns:
+            Number of new strategies discovered via scraping.
+        """
+        new_count = 0
+        consecutive_misses = 0
+        cache = Path(cache_dir) if cache_dir else None
+        if cache:
+            cache.mkdir(parents=True, exist_ok=True)
+
+        for num in range(start, end + 1):
+            det_id = f"DET{num:04d}"
+            if det_id in self._strategies:
+                consecutive_misses = 0
+                continue  # already have it from STIX bundle
+
+            url = f"https://attack.mitre.org/detectionstrategies/{det_id}/"
+            strategy = _scrape_det_page(url, det_id, cache=cache)
+
+            if strategy is None:
+                consecutive_misses += 1
+                if consecutive_misses >= stop_on_consecutive_misses:
+                    logger.info(
+                        "Web scraper stopping after %d consecutive misses at %s",
+                        consecutive_misses, det_id,
+                    )
+                    break
+                time.sleep(request_delay)
+                continue
+
+            # Merge into index
+            consecutive_misses = 0
+            self._strategies[det_id] = strategy
+            for tech_id in strategy.technique_ids:
+                self._by_technique.setdefault(tech_id, []).append(strategy)
+            new_count += 1
+            logger.info("Web scraper: discovered new strategy %s — %s", det_id, strategy.name)
+
+            time.sleep(request_delay)
+
+        logger.info("Web scraper complete: %d new strategies found", new_count)
+        return new_count
+
     # --- Summary ---
 
     def summary(self) -> dict:
@@ -334,3 +421,235 @@ class MitreDetectionStrategies:
             "covered_techniques": len(self._by_technique),
             "bundle_path": str(self._bundle_path),
         }
+
+
+# ---------------------------------------------------------------------------
+# Web page scraper (standalone helper)
+# ---------------------------------------------------------------------------
+
+_ATTACK_BASE = "https://attack.mitre.org"
+
+
+def _scrape_det_page(
+    url: str,
+    det_id: str,
+    cache: Optional[Path] = None,
+) -> Optional[DetectionStrategy]:
+    """
+    Scrape a single DETxxxx page and return a DetectionStrategy, or None on 404/error.
+
+    Parses the ATT&CK website HTML to extract:
+      - Strategy name and description
+      - Associated ATT&CK technique IDs
+      - Platform list
+      - Analytics (AN-xxxx) descriptions
+    """
+    # Check cache first
+    if cache:
+        cache_file = cache / f"{det_id}.html"
+        if cache_file.exists():
+            html = cache_file.read_text(encoding="utf-8")
+        else:
+            html = _fetch_html(url)
+            if html is None:
+                return None
+            cache_file.write_text(html, encoding="utf-8")
+    else:
+        html = _fetch_html(url)
+        if html is None:
+            return None
+
+    return _parse_det_html(html, det_id, url)
+
+
+def _fetch_html(url: str) -> Optional[str]:
+    """Fetch URL; return HTML text or None on 404/error."""
+    try:
+        resp = _HTTP.get(url, timeout=_TIMEOUT, allow_redirects=True)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.text
+    except requests.HTTPError:
+        return None
+    except Exception as exc:
+        logger.debug("Failed to fetch %s: %s", url, exc)
+        return None
+
+
+def _parse_det_html(html: str, det_id: str, page_url: str) -> Optional[DetectionStrategy]:
+    """
+    Parse ATT&CK detection strategy page HTML.
+
+    ATT&CK pages use a consistent structure:
+      <h1 class="page-title"> ... Name </h1>
+      <div class="description-body"> ... description ... </div>
+      <div class="technique-field"> ID: DETxxxx </div>
+      Technique links: /techniques/Txxxx/
+      Platform badges in the technique card
+      Analytics: table rows with ANxxxx IDs
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        # Fallback: regex-based extraction when beautifulsoup4 not installed
+        return _parse_det_html_regex(html, det_id, page_url)
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- Name ---
+    name = ""
+    title_el = soup.find("h1", class_=re.compile("page-title|pagetitle", re.I))
+    if not title_el:
+        title_el = soup.find("h1")
+    if title_el:
+        name = title_el.get_text(strip=True)
+
+    if not name:
+        return None  # page probably doesn't exist or is an error page
+
+    # --- Description ---
+    desc = ""
+    desc_el = soup.find("div", class_=re.compile("description-body", re.I))
+    if desc_el:
+        desc = desc_el.get_text(separator=" ", strip=True)[:1000]
+
+    # --- Techniques (from /techniques/Txxxx/ links) ---
+    technique_ids: list[str] = []
+    for link in soup.find_all("a", href=re.compile(r"/techniques/T\d{4}")):
+        href = link.get("href", "")
+        m = re.search(r"/techniques/(T\d{4}(?:/\d{3})?)", href)
+        if m:
+            tech_id = m.group(1).replace("/", ".")
+            if tech_id not in technique_ids:
+                technique_ids.append(tech_id)
+
+    # --- Platforms ---
+    platforms: list[str] = []
+    for badge in soup.find_all(class_=re.compile("platform-badge|badge", re.I)):
+        text = badge.get_text(strip=True)
+        if text and len(text) < 30:
+            platforms.append(text)
+
+    # --- Analytics (ANxxxx) ---
+    analytics: list[AnalyticEntry] = []
+    for row in soup.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) >= 2:
+            an_id_text = cells[0].get_text(strip=True)
+            an_desc = cells[1].get_text(strip=True)
+            if re.match(r"AN\d{4}", an_id_text, re.I):
+                analytics.append(AnalyticEntry(
+                    analytic_id=an_id_text.upper(),
+                    name=an_id_text,
+                    description=an_desc[:500],
+                    detection_logic=an_desc[:500],
+                ))
+
+    return DetectionStrategy(
+        det_id=det_id,
+        name=name,
+        description=desc,
+        technique_ids=technique_ids,
+        analytics=analytics,
+        platforms=list(set(platforms)),
+        url=page_url,
+    )
+
+
+def _parse_det_html_regex(html: str, det_id: str, page_url: str) -> Optional[DetectionStrategy]:
+    """
+    Regex-based fallback parser (no beautifulsoup4 dependency).
+    Extracts the minimum viable fields from the ATT&CK page HTML.
+    """
+    # Name: look for <h1 ...>...</h1>
+    m_name = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE)
+    if not m_name:
+        return None
+    name = re.sub(r'<[^>]+>', '', m_name.group(1)).strip()
+    if not name or len(name) > 200:
+        return None
+
+    # Description: first substantial paragraph after the title
+    m_desc = re.search(r'<p[^>]*>(.*?)</p>', html, re.DOTALL | re.IGNORECASE)
+    desc = ""
+    if m_desc:
+        desc = re.sub(r'<[^>]+>', '', m_desc.group(1)).strip()[:500]
+
+    # Technique IDs from links
+    technique_ids = list(dict.fromkeys(
+        m.group(1).replace("/", ".")
+        for m in re.finditer(r'/techniques/(T\d{4}(?:/\d{3})?)', html)
+    ))
+
+    # Analytics IDs
+    analytics = [
+        AnalyticEntry(analytic_id=an_id, name=an_id, description="", detection_logic="")
+        for an_id in dict.fromkeys(re.findall(r'\b(AN\d{4})\b', html, re.IGNORECASE))
+    ]
+
+    return DetectionStrategy(
+        det_id=det_id,
+        name=name,
+        description=desc,
+        technique_ids=technique_ids,
+        analytics=analytics,
+        url=page_url,
+    )
+
+
+def scrape_all_det_strategies(
+    start: int = 1,
+    end: int = 9999,
+    request_delay: float = 1.0,
+    stop_on_consecutive_misses: int = 20,
+    cache_dir: Optional[str | Path] = None,
+) -> list[DetectionStrategy]:
+    """
+    Standalone function: crawl all DETxxxx pages and return the discovered strategies.
+    Useful for a one-off bulk scrape without instantiating MitreDetectionStrategies.
+
+    Args:
+        start, end:                     DET number range to crawl
+        request_delay:                  Seconds between requests
+        stop_on_consecutive_misses:     Stop early after N consecutive 404s
+        cache_dir:                      Cache raw HTML pages here
+
+    Returns:
+        List of DetectionStrategy objects discovered.
+    """
+    strategies: list[DetectionStrategy] = []
+    consecutive_misses = 0
+    cache = Path(cache_dir) if cache_dir else None
+    if cache:
+        cache.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Scraping DET%04d–DET%04d from attack.mitre.org …", start, end
+    )
+
+    for num in range(start, end + 1):
+        det_id = f"DET{num:04d}"
+        url = f"{_ATTACK_BASE}/detectionstrategies/{det_id}/"
+        strategy = _scrape_det_page(url, det_id, cache=cache)
+
+        if strategy is None:
+            consecutive_misses += 1
+            if consecutive_misses >= stop_on_consecutive_misses:
+                logger.info(
+                    "Stopping scrape after %d consecutive misses at %s",
+                    consecutive_misses, det_id,
+                )
+                break
+        else:
+            consecutive_misses = 0
+            strategies.append(strategy)
+            logger.debug("Scraped %s: %s", det_id, strategy.name)
+
+        if num % 50 == 0:
+            logger.info("Scraping progress: %s (found %d so far)", det_id, len(strategies))
+
+        time.sleep(request_delay)
+
+    logger.info("Scrape complete: %d strategies found", len(strategies))
+    return strategies
